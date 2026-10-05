@@ -1,4 +1,13 @@
-import type { Cue, CueConflict, LightingPlan, Scene, UserRole } from './types';
+import type {
+  Circuit,
+  CircuitReport,
+  Cue,
+  CueConflict,
+  LightingPlan,
+  PositionPatch,
+  Scene,
+  UserRole
+} from './types';
 
 const FIXED_TIME = '2026-09-25T02:00:00.000Z';
 
@@ -69,11 +78,61 @@ function scene(id: string, name: string, order: number, frozen: boolean, cues: C
   return { id, name, order, frozen, cues };
 }
 
+function circuit(id: string, name: string, capacity: number): Circuit {
+  return { id, name, capacity };
+}
+
+function patchEntry(id: string, position: string, circuitId: string, ratedCurrent: number): PositionPatch {
+  return { id, position, circuitId, ratedCurrent };
+}
+
+const mainCircuits: Circuit[] = [
+  circuit('main-cir-a', '回路 A · 面光', 24),
+  circuit('main-cir-b', '回路 B · 侧光', 20),
+  circuit('main-cir-c', '回路 C · 天幕', 12),
+  circuit('main-cir-d', '回路 D · 效果', 32)
+];
+
+const mainPatch: PositionPatch[] = [
+  patchEntry('main-patch-1', '左前区', 'main-cir-a', 9),
+  patchEntry('main-patch-2', '前区', 'main-cir-a', 12),
+  patchEntry('main-patch-3', '侧幕', 'main-cir-b', 8),
+  patchEntry('main-patch-4', '侧区', 'main-cir-b', 10),
+  patchEntry('main-patch-5', '天幕', 'main-cir-c', 10),
+  patchEntry('main-patch-6', '全台', 'main-cir-d', 24),
+  patchEntry('main-patch-7', '后区', 'main-cir-d', 14)
+];
+
+const coolCircuits: Circuit[] = [
+  circuit('cool-cir-1', '冷调回路 1', 16),
+  circuit('cool-cir-2', '冷调回路 2', 12)
+];
+
+const coolPatch: PositionPatch[] = [
+  patchEntry('cool-patch-1', '全台', 'cool-cir-1', 10),
+  patchEntry('cool-patch-2', '左后', 'cool-cir-1', 8),
+  patchEntry('cool-patch-3', '天幕', 'cool-cir-2', 9),
+  patchEntry('cool-patch-4', '右侧', 'cool-cir-2', 6)
+];
+
+const tourCircuits: Circuit[] = [
+  circuit('tour-cir-a', '巡演回路 A', 10),
+  circuit('tour-cir-b', '巡演回路 B', 12)
+];
+
+const tourPatch: PositionPatch[] = [
+  patchEntry('tour-patch-1', '全台', 'tour-cir-a', 12),
+  patchEntry('tour-patch-2', '天幕', 'tour-cir-a', 6),
+  patchEntry('tour-patch-3', '后区', 'tour-cir-b', 10)
+];
+
 const mainPlan: LightingPlan = {
   id: 'plan-main',
   name: '主舞台方案',
   description: '完整剧院版本，保留大面积侧光与低角度造型。',
   updatedAt: FIXED_TIME,
+  circuits: mainCircuits,
+  patch: mainPatch,
   scenes: [
     scene('scene-1', '序章 · 入梦', 1, false, [
       cue('Q1', '观众席暗场', '全台', 'Grand Master', '黑场', '#000000', 0, 4, 6, 3, '', '场灯降至 10%', '开演提示与场灯联动。', 'confirmed'),
@@ -105,6 +164,8 @@ const coolPlan: LightingPlan = {
   name: '冷调实验方案',
   description: '减少正面光，以侧逆光和天幕色块建立空间。',
   updatedAt: FIXED_TIME,
+  circuits: coolCircuits,
+  patch: coolPatch,
   scenes: [
     scene('cool-scene-1', '序章 · 入梦（冷调）', 1, false, [
       cue('C1', '冷场', '全台', 'Grand Master', '深蓝', '#1D4ED8', 14, 5, 8, 5, '', '场灯渐暗', '冷调版本无全黑场。', 'ready'),
@@ -122,6 +183,8 @@ const tourPlan: LightingPlan = {
   name: '巡演简约方案',
   description: '适配中小剧场，合并天幕和侧光通道。',
   updatedAt: FIXED_TIME,
+  circuits: tourCircuits,
+  patch: tourPatch,
   scenes: [
     scene('tour-scene-1', '序章 · 入梦', 1, false, [
       cue('T1', '场灯收束', '全台', 'Master', '暖白', '#FFF1C7', 18, 3, 5, 4, '', '开场', '巡演设备清单已确认。', 'ready'),
@@ -136,11 +199,43 @@ const tourPlan: LightingPlan = {
 
 export const samplePlans = [mainPlan, coolPlan, tourPlan];
 
+/** 为旧草稿或新方案补齐回路数据结构；仅在不存在的旧数据上迁移，不覆盖用户登记 */
+export function ensurePlanInfrastructure(plan: LightingPlan): LightingPlan {
+  if (!Array.isArray(plan.circuits) || !plan.circuits.length) {
+    plan.circuits = [circuit(`${plan.id}-cir-default`, '默认回路', 16)];
+  }
+  if (!Array.isArray(plan.patch)) {
+    plan.patch = [];
+    const known = new Set<string>();
+    let sequence = 0;
+    for (const scene of plan.scenes) {
+      for (const item of scene.cues) {
+        const position = item.position.trim();
+        if (!position || known.has(position)) continue;
+        known.add(position);
+        sequence += 1;
+        plan.patch.push(patchEntry(`${plan.id}-patch-auto-${sequence}`, position, plan.circuits[0].id, 8));
+      }
+    }
+  }
+  return plan;
+}
+
 export function recalculatePlans(plans: LightingPlan[]) {
   for (const plan of plans) {
+    ensurePlanInfrastructure(plan);
     const scenes = [...plan.scenes].sort((a, b) => a.order - b.order);
     let absoluteCursor = 0;
     for (const scene of scenes) {
+      // 已冻结场次照原样保留：不重排内部时间，仅把后续场次的起点推到其记录时长之后
+      const hasRecordedTiming =
+        scene.startTime !== undefined &&
+        scene.duration !== undefined &&
+        scene.cues.every((item) => item.startTime !== undefined && item.endTime !== undefined);
+      if (scene.frozen && hasRecordedTiming) {
+        absoluteCursor = Math.max(absoluteCursor, (scene.startTime ?? 0) + (scene.duration ?? 0));
+        continue;
+      }
       scene.startTime = absoluteCursor;
       let sceneCursor = absoluteCursor;
       for (const item of scene.cues) {
@@ -161,9 +256,110 @@ export function recalculatePlans(plans: LightingPlan[]) {
   return plans;
 }
 
+export function formatSeconds(value: number) {
+  const safe = Math.max(0, value);
+  const minutes = Math.floor(safe / 60);
+  const seconds = Math.floor(safe % 60);
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
+
+const EPSILON = 1e-6;
+
+/**
+ * 按整剧时间轴核算每个回路的负载：
+ * 同一回路内时间重叠的提示按「额定电流 × 亮度%」折算后累加，
+ * 返回峰值与超过回路容量的冲突时段。
+ */
+export function analyzeCircuitLoad(plan: LightingPlan): CircuitReport[] {
+  const patchByPosition = new Map(plan.patch.map((entry) => [entry.position, entry]));
+  const contributions = new Map<string, { cue: Cue; load: number; start: number; end: number }[]>();
+
+  for (const scene of plan.scenes) {
+    for (const item of scene.cues) {
+      const entry = patchByPosition.get(item.position);
+      if (!entry) continue;
+      const brightness = Math.min(100, Math.max(0, item.brightness));
+      const load = (entry.ratedCurrent * brightness) / 100;
+      const start = item.startTime ?? 0;
+      const end = item.endTime ?? start;
+      if (end - start <= EPSILON) continue;
+      const list = contributions.get(entry.circuitId) ?? [];
+      list.push({ cue: item, load, start, end });
+      contributions.set(entry.circuitId, list);
+    }
+  }
+
+  return plan.circuits.map((circuitItem) => {
+    const entries = contributions.get(circuitItem.id) ?? [];
+    const points = [...new Set(entries.flatMap((entry) => [entry.start, entry.end]))].sort((a, b) => a - b);
+    let peak = 0;
+    let peakStart = 0;
+    let peakEnd = 0;
+    const overloads: CircuitReport['overloads'] = [];
+
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const start = points[index];
+      const end = points[index + 1];
+      const active = entries.filter((entry) => entry.start < end - EPSILON && entry.end > start + EPSILON);
+      const load = active.reduce((sum, entry) => sum + entry.load, 0);
+      if (load > peak + EPSILON) {
+        peak = load;
+        peakStart = start;
+        peakEnd = end;
+      } else if (load > 0 && Math.abs(load - peak) <= EPSILON && Math.abs(start - peakEnd) <= EPSILON) {
+        peakEnd = end;
+      }
+      if (load > circuitItem.capacity + EPSILON) {
+        const last = overloads[overloads.length - 1];
+        if (last && Math.abs(last.end - start) <= EPSILON) {
+          last.end = end;
+          last.peak = Math.max(last.peak, load);
+          for (const entry of active) {
+            if (!last.cueIds.includes(entry.cue.id)) last.cueIds.push(entry.cue.id);
+          }
+        } else {
+          overloads.push({ start, end, peak: load, cueIds: active.map((entry) => entry.cue.id) });
+        }
+      }
+    }
+
+    return {
+      circuitId: circuitItem.id,
+      capacity: circuitItem.capacity,
+      peak: Number(peak.toFixed(2)),
+      peakStart,
+      peakEnd,
+      overloads: overloads.map((segment) => ({ ...segment, peak: Number(segment.peak.toFixed(2)) })),
+      patchedPositions: plan.patch.filter((entry) => entry.circuitId === circuitItem.id).length
+    };
+  });
+}
+
 export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
   const conflicts: CueConflict[] = [];
   for (const plan of plans) {
+    // 回路负载核算：按整剧时间轴检查重叠提示折算后的总负载
+    const circuitById = new Map(plan.circuits.map((item) => [item.id, item]));
+    const sceneOfCue = new Map<string, string>();
+    for (const scene of plan.scenes) {
+      for (const item of scene.cues) sceneOfCue.set(item.id, scene.id);
+    }
+    for (const report of analyzeCircuitLoad(plan)) {
+      const circuitItem = circuitById.get(report.circuitId);
+      for (const segment of report.overloads) {
+        const leadCueId = segment.cueIds[0] ?? '';
+        conflicts.push({
+          id: `${plan.id}-${report.circuitId}-overload-${segment.start.toFixed(2)}`,
+          planId: plan.id,
+          sceneId: sceneOfCue.get(leadCueId) ?? plan.scenes[0]?.id ?? '',
+          cueId: leadCueId,
+          severity: 'error',
+          type: 'circuit-overload',
+          message: `${circuitItem?.name ?? '回路'}在 ${formatSeconds(segment.start)}–${formatSeconds(segment.end)} 重叠折算负载峰值 ${segment.peak.toFixed(1)}A，超过容量 ${report.capacity}A，冻结与导出已锁定`
+        });
+      }
+    }
+    const patchedPositions = new Set(plan.patch.map((entry) => entry.position));
     for (const scene of plan.scenes) {
       const byChannel = new Map<string, Cue[]>();
       const positions = new Map<string, Cue[]>();
@@ -183,6 +379,17 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             severity: 'error',
             type: 'missing-data',
             message: `${item.number} ${errors.join('、')}`
+          });
+        }
+        if (item.position.trim() && !patchedPositions.has(item.position)) {
+          conflicts.push({
+            id: `${plan.id}-${scene.id}-${item.id}-unpatched`,
+            planId: plan.id,
+            sceneId: scene.id,
+            cueId: item.id,
+            severity: 'warning',
+            type: 'circuit-unpatched',
+            message: `${item.number} 的灯位「${item.position}」未登记所属回路，未计入负载核算`
           });
         }
         if (!item.followCueId) continue;

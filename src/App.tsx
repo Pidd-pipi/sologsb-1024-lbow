@@ -21,6 +21,7 @@ import {
   NumberInput,
   NumberInputField,
   NumberInputStepper,
+  Progress,
   Select,
   SimpleGrid,
   Spacer,
@@ -76,13 +77,17 @@ import {
   Trash2,
   Undo2,
   Unlock,
+  Users,
   Wifi,
-  WifiOff
+  WifiOff,
+  Zap
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  analyzeCircuitLoad,
   colorPresets,
   detectConflicts,
+  formatSeconds,
   roleLabels,
   statusLabels
 } from './data';
@@ -90,13 +95,35 @@ import {
   LIGHTING_STORAGE_KEY,
   canEditScene,
   canFreeze,
+  canPatchCircuits,
   findActivePlan,
   findActiveScene,
   findActiveCue,
   formatTime,
   useLightingDesk
 } from './state/useLightingDesk';
-import type { Cue, CueConflict, LightingPlan, Scene, UserRole, Workspace } from './types';
+import {
+  SERVER_STORAGE_KEY,
+  describeDraftDiff,
+  diffCircuitChanges,
+  hasCircuitOverlap,
+  mergeTheirCircuitChanges,
+  readServerSnapshot,
+  writeServerSnapshot
+} from './sync';
+import type {
+  Circuit,
+  CircuitReport,
+  Cue,
+  CueConflict,
+  LightingPlan,
+  PendingCircuitDraft,
+  PositionPatch,
+  Scene,
+  ServerSnapshot,
+  UserRole,
+  Workspace
+} from './types';
 
 const statusColors = {
   draft: 'orange',
@@ -110,7 +137,9 @@ function conflictLabel(conflict: CueConflict) {
     'follow-order': '跟随关系',
     'missing-data': '数据缺失',
     'duplicate-position': '灯位重复',
-    duration: '时间异常'
+    duration: '时间异常',
+    'circuit-overload': '回路过载',
+    'circuit-unpatched': '回路未登记'
   }[conflict.type];
 }
 
@@ -252,16 +281,22 @@ interface InspectorProps {
   canEdit: boolean;
   conflicts: CueConflict[];
   onApply: (draft: Cue) => void;
+  onBrightnessCommit: (value: number) => void;
   onDelete: () => void;
   onSelectCue: (cueId: string) => void;
 }
 
-function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDelete, onSelectCue }: InspectorProps) {
+function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onBrightnessCommit, onDelete, onSelectCue }: InspectorProps) {
   const [draft, setDraft] = useState<Cue | null>(cue ? structuredClone(cue) : null);
 
   useEffect(() => {
     setDraft(cue ? structuredClone(cue) : null);
   }, [cue?.id]);
+
+  const activePlan = workspace.plans.find((plan) => plan.id === workspace.activePlanId);
+  const patchEntry = activePlan?.patch.find((entry) => entry.position === cue?.position);
+  const circuit = activePlan?.circuits.find((item) => item.id === patchEntry?.circuitId);
+  const circuitInfo = patchEntry && circuit ? { entry: patchEntry, circuit } : null;
 
   if (!cue || !draft) {
     return (
@@ -310,6 +345,11 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
         <FormControl>
           <FormLabel htmlFor="cue-position">灯位 / 区域</FormLabel>
           <Input id="cue-position" value={draft.position} isDisabled={!canEdit} onChange={(event) => update('position', event.target.value)} />
+          <Text mt={1} fontSize="11px" color={circuitInfo ? 'whiteAlpha.500' : 'orange.300'}>
+            {circuitInfo
+              ? `回路：${circuitInfo.circuit.name} · 额定 ${circuitInfo.entry.ratedCurrent}A · 当前折算 ${((circuitInfo.entry.ratedCurrent * draft.brightness) / 100).toFixed(1)}A`
+              : '该灯位未登记所属回路，请在“回路负载”页签补登'}
+          </Text>
         </FormControl>
         <FormControl>
           <FormLabel htmlFor="cue-channel">控制通道</FormLabel>
@@ -339,7 +379,7 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
       </SimpleGrid>
 
       <FormControl>
-        <FormLabel>亮度 {draft.brightness}%</FormLabel>
+        <FormLabel>亮度 {draft.brightness}%（松手后立即重算回路负载）</FormLabel>
         <input
           aria-label="提示亮度"
           type="range"
@@ -348,6 +388,12 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
           value={draft.brightness}
           disabled={!canEdit}
           onChange={(event) => update('brightness', Number(event.target.value))}
+          onPointerUp={(event) => onBrightnessCommit(Number((event.target as HTMLInputElement).value))}
+          onKeyUp={(event) => {
+            if (event.key.startsWith('Arrow') || event.key === 'Home' || event.key === 'End') {
+              onBrightnessCommit(Number((event.target as HTMLInputElement).value));
+            }
+          }}
           style={{ width: '100%', accentColor: '#f6c453' }}
         />
       </FormControl>
@@ -566,12 +612,239 @@ function ComparePlan({
   );
 }
 
+interface CircuitPanelProps {
+  plan: LightingPlan;
+  reports: CircuitReport[];
+  canPatch: boolean;
+  pendingDrafts: PendingCircuitDraft[];
+  serverSnapshot: ServerSnapshot | null;
+  onUpdateCircuit: (circuitId: string, changes: Partial<Circuit>) => void;
+  onAddCircuit: () => void;
+  onUpdatePatch: (patchId: string, changes: Partial<PositionPatch>) => void;
+  onAddPatch: () => void;
+  onRemovePatch: (patchId: string) => void;
+  onApplyDraft: (draft: PendingCircuitDraft) => void;
+  onDiscardDraft: (draft: PendingCircuitDraft) => void;
+  onSimulatePeer: () => void;
+}
+
+function CircuitPanel({
+  plan,
+  reports,
+  canPatch,
+  pendingDrafts,
+  serverSnapshot,
+  onUpdateCircuit,
+  onAddCircuit,
+  onUpdatePatch,
+  onAddPatch,
+  onRemovePatch,
+  onApplyDraft,
+  onDiscardDraft,
+  onSimulatePeer
+}: CircuitPanelProps) {
+  const planDrafts = pendingDrafts.filter((draft) => draft.planId === plan.id);
+  const otherDraftCount = pendingDrafts.length - planDrafts.length;
+
+  return (
+    <VStack align="stretch" spacing={4}>
+      {planDrafts.map((draft) => {
+        const serverPlan = serverSnapshot?.workspace.plans.find((item) => item.id === draft.planId);
+        const lines = describeDraftDiff(draft, serverPlan);
+        return (
+          <Box key={draft.id} p={3} borderRadius="lg" bg="orange.900" borderWidth="1px" borderColor="orange.600">
+            <Flex align="center" gap={2} mb={2}>
+              <Users size={14} />
+              <Text fontSize="sm" fontWeight="700">待确认差异 · {draft.author}</Text>
+              <Spacer />
+              <Text fontSize="10px" color="whiteAlpha.600">
+                {new Date(draft.savedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+              </Text>
+            </Flex>
+            <Text fontSize="11px" color="whiteAlpha.700" mb={2}>
+              双方同时修改了同一回路，对方版本未被覆盖。核对差异后选择采用或放弃：
+            </Text>
+            <VStack align="stretch" spacing={1} mb={3}>
+              {lines.map((line, index) => (
+                <Text key={index} fontSize="xs" color="whiteAlpha.800">· {line}</Text>
+              ))}
+            </VStack>
+            <HStack>
+              <Button size="xs" colorScheme="amber" onClick={() => onApplyDraft(draft)}>采用该草稿</Button>
+              <Button size="xs" variant="ghost" onClick={() => onDiscardDraft(draft)}>放弃草稿，保留对方版本</Button>
+            </HStack>
+          </Box>
+        );
+      })}
+      {otherDraftCount > 0 ? (
+        <Text fontSize="11px" color="orange.200">另有 {otherDraftCount} 份待确认草稿属于其他方案，切换到对应方案后处理。</Text>
+      ) : null}
+
+      <Box>
+        <Text color="whiteAlpha.600" fontSize="xs" mb={2}>
+          回路负载按整剧时间轴核算：重叠提示按亮度折算电流后累加，超过容量将拒绝冻结与导出。
+        </Text>
+        <VStack align="stretch" spacing={3}>
+          {reports.map((report) => {
+            const circuitItem = plan.circuits.find((item) => item.id === report.circuitId);
+            if (!circuitItem) return null;
+            const overloaded = report.overloads.length > 0;
+            const utilization = Math.min(100, (report.peak / Math.max(0.1, report.capacity)) * 100);
+            return (
+              <Box
+                key={report.circuitId}
+                p={3}
+                borderRadius="lg"
+                bg="blackAlpha.200"
+                borderWidth="1px"
+                borderColor={overloaded ? 'red.700' : 'whiteAlpha.100'}
+              >
+                <Flex align="center" gap={2}>
+                  <Zap size={15} color={overloaded ? '#fc8181' : '#f6c453'} />
+                  <Input
+                    size="sm"
+                    value={circuitItem.name}
+                    isDisabled={!canPatch}
+                    aria-label="回路名称"
+                    onChange={(event) => onUpdateCircuit(circuitItem.id, { name: event.target.value })}
+                  />
+                  <NumberInput
+                    size="sm"
+                    w="86px"
+                    min={1}
+                    step={1}
+                    value={circuitItem.capacity}
+                    isDisabled={!canPatch}
+                    aria-label="回路容量（安培）"
+                    onChange={(_, value) => {
+                      if (!Number.isNaN(value)) onUpdateCircuit(circuitItem.id, { capacity: value });
+                    }}
+                  >
+                    <NumberInputField />
+                  </NumberInput>
+                  <Text fontSize="xs" color="whiteAlpha.500">A</Text>
+                </Flex>
+                <Flex mt={2} align="center" fontSize="xs" color="whiteAlpha.500" gap={2}>
+                  <Text>
+                    整剧峰值 {report.peak.toFixed(1)}A
+                    {report.peak > 0 ? `（${formatSeconds(report.peakStart)}–${formatSeconds(report.peakEnd)}）` : ''}
+                  </Text>
+                  <Spacer />
+                  <Text color={overloaded ? 'red.300' : 'green.300'}>
+                    {overloaded ? `超载 ${report.overloads.length} 段` : '容量内'} · {report.patchedPositions} 灯位
+                  </Text>
+                </Flex>
+                <Progress
+                  mt={2}
+                  value={utilization}
+                  size="sm"
+                  borderRadius="full"
+                  colorScheme={overloaded ? 'red' : utilization > 80 ? 'orange' : 'green'}
+                  aria-label={`${circuitItem.name} 负载率 ${utilization.toFixed(0)}%`}
+                />
+                {report.overloads.map((segment, index) => (
+                  <Text key={index} mt={1} fontSize="11px" color="red.300">
+                    超载时段 {formatSeconds(segment.start)}–{formatSeconds(segment.end)} · 峰值 {segment.peak.toFixed(1)}A / 容量 {report.capacity}A
+                  </Text>
+                ))}
+              </Box>
+            );
+          })}
+        </VStack>
+        <Button mt={3} size="sm" variant="outline" leftIcon={<Plus size={14} />} isDisabled={!canPatch} onClick={onAddCircuit}>
+          新增回路
+        </Button>
+      </Box>
+
+      <Divider />
+
+      <Box>
+        <Text color="whiteAlpha.600" fontSize="xs" mb={2}>
+          灯位回路登记：换台拆灯后在此调整每个灯位的所属回路和额定电流。
+        </Text>
+        <VStack align="stretch" spacing={2}>
+          {plan.patch.map((entry) => (
+            <Flex key={entry.id} gap={2} align="center">
+              <Input
+                size="sm"
+                w="32%"
+                value={entry.position}
+                isDisabled={!canPatch}
+                aria-label="灯位名称"
+                onChange={(event) => onUpdatePatch(entry.id, { position: event.target.value })}
+              />
+              <Select
+                size="sm"
+                value={entry.circuitId}
+                isDisabled={!canPatch}
+                aria-label="所属回路"
+                onChange={(event) => onUpdatePatch(entry.id, { circuitId: event.target.value })}
+              >
+                {plan.circuits.map((item) => (
+                  <option key={item.id} value={item.id}>{item.name}</option>
+                ))}
+              </Select>
+              <NumberInput
+                size="sm"
+                w="76px"
+                min={0}
+                step={0.5}
+                value={entry.ratedCurrent}
+                isDisabled={!canPatch}
+                aria-label="额定电流（安培）"
+                onChange={(_, value) => {
+                  if (!Number.isNaN(value)) onUpdatePatch(entry.id, { ratedCurrent: value });
+                }}
+              >
+                <NumberInputField />
+              </NumberInput>
+              <Text fontSize="xs" color="whiteAlpha.500">A</Text>
+              <IconButton
+                aria-label={`删除灯位 ${entry.position} 的回路登记`}
+                size="sm"
+                variant="ghost"
+                icon={<Trash2 size={14} />}
+                isDisabled={!canPatch}
+                onClick={() => onRemovePatch(entry.id)}
+              />
+            </Flex>
+          ))}
+          {!plan.patch.length ? <Text fontSize="xs" color="whiteAlpha.500">尚未登记任何灯位回路。</Text> : null}
+        </VStack>
+        <Button mt={2} size="sm" variant="outline" leftIcon={<Plus size={14} />} isDisabled={!canPatch} onClick={onAddPatch}>
+          登记灯位
+        </Button>
+      </Box>
+
+      <Divider />
+
+      <Box p={3} borderRadius="lg" borderWidth="1px" borderStyle="dashed" borderColor="whiteAlpha.200">
+        <Flex align="center" gap={2} mb={1}>
+          <Users size={14} color="#f6c453" />
+          <Text fontSize="xs" fontWeight="700">协作与版本</Text>
+        </Flex>
+        <Text fontSize="11px" color="whiteAlpha.500" lineHeight="1.7">
+          保存以模拟服务器版本为准：若另一终端先保存且改动同一回路，后到的保存会保留双方草稿与待确认差异，不会覆盖对方。
+          也可用两个浏览器窗口同时打开本页验证。
+        </Text>
+        <Button mt={2} size="xs" variant="ghost" leftIcon={<Users size={13} />} onClick={onSimulatePeer}>
+          模拟另一终端修改并保存此方案回路
+        </Button>
+      </Box>
+    </VStack>
+  );
+}
+
 export default function App() {
   const [state, dispatch] = useLightingDesk();
   const [hydrated, setHydrated] = useState(false);
   const [online, setOnline] = useState(true);
   const [savedAt, setSavedAt] = useState('');
   const [syncMessage, setSyncMessage] = useState('离线草稿待命');
+  const [baseRevision, setBaseRevision] = useState(0);
+  const [pendingDrafts, setPendingDrafts] = useState<PendingCircuitDraft[]>([]);
+  const [serverSnapshot, setServerSnapshot] = useState<ServerSnapshot | null>(null);
+  const baseWorkspaceRef = useRef<Workspace | null>(null);
   const toast = useToast();
   const workspace = state.workspace;
   const activePlan = findActivePlan(workspace);
@@ -583,8 +856,11 @@ export default function App() {
   const activeCueConflicts = selectedCue
     ? allConflicts.filter((item) => item.cueId === selectedCue.id)
     : [];
+  const circuitReports = useMemo(() => analyzeCircuitLoad(activePlan), [activePlan]);
+  const overloadCount = circuitReports.reduce((sum, report) => sum + report.overloads.length, 0);
   const editable = canEditScene(workspace.role, activeScene);
   const freezer = canFreeze(workspace.role);
+  const patcher = canPatchCircuits(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
 
   useEffect(() => {
@@ -596,6 +872,14 @@ export default function App() {
       }
     } catch {
       setSyncMessage('离线草稿损坏，已载入模拟方案');
+    }
+    const snapshot = readServerSnapshot();
+    if (snapshot) {
+      setServerSnapshot(snapshot);
+      setBaseRevision(snapshot.revision);
+      setPendingDrafts(snapshot.pendingDrafts);
+      baseWorkspaceRef.current = snapshot.workspace;
+      setSyncMessage(`已连接模拟服务器，当前版本 r${snapshot.revision}（${snapshot.savedBy}）`);
     }
     setHydrated(true);
     setOnline(navigator.onLine);
@@ -610,6 +894,14 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [hydrated, workspace]);
 
+  // 记录本地工作区的基准版本，用于保存时与服务器版本做回路差异核对
+  useEffect(() => {
+    if (hydrated && !baseWorkspaceRef.current) {
+      baseWorkspaceRef.current = structuredClone(workspace);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated]);
+
   useEffect(() => {
     const handleOnline = () => setOnline(true);
     const handleOffline = () => setOnline(false);
@@ -620,6 +912,21 @@ export default function App() {
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== SERVER_STORAGE_KEY) return;
+      const snapshot = readServerSnapshot();
+      if (!snapshot) return;
+      setServerSnapshot(snapshot);
+      setPendingDrafts(snapshot.pendingDrafts);
+      if (snapshot.revision !== baseRevision) {
+        setSyncMessage(`另一终端已保存版本 r${snapshot.revision}（${snapshot.savedBy}），保存时将核对回路差异`);
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, [baseRevision]);
 
   function commit(label: string, mutate: (next: Workspace) => void) {
     dispatch({ type: 'commit', label, mutate });
@@ -648,6 +955,17 @@ export default function App() {
       Object.assign(cue, fields);
     });
     toast({ title: '提示参数已应用', status: 'success', duration: 1800 });
+  }
+
+  function applyBrightness(value: number) {
+    if (!selectedCue) return;
+    commit('调整亮度并立即重算回路负载', (next) => {
+      const cue = next.plans
+        .find((plan) => plan.id === next.activePlanId)
+        ?.scenes.find((scene) => scene.id === next.selectedSceneId)
+        ?.cues.find((item) => item.id === selectedCue.id);
+      if (cue) cue.brightness = Math.min(100, Math.max(0, value));
+    });
   }
 
   function deleteCue() {
@@ -696,6 +1014,20 @@ export default function App() {
     if (!activeScene || !freezer) {
       toast({ title: '当前角色不能冻结或解冻场次', status: 'warning' });
       return;
+    }
+    if (!activeScene.frozen) {
+      const overload = activeConflicts.find(
+        (item) => item.type === 'circuit-overload' && item.sceneId === activeScene.id
+      );
+      if (overload) {
+        toast({
+          title: '回路负载超过容量，已拒绝冻结',
+          description: overload.message,
+          status: 'error',
+          duration: 4200
+        });
+        return;
+      }
     }
     commit(activeScene.frozen ? '解除场次冻结' : '冻结已确认场次', (next) => {
       const scene = next.plans.find((plan) => plan.id === next.activePlanId)?.scenes.find((item) => item.id === next.selectedSceneId);
@@ -754,8 +1086,207 @@ export default function App() {
     await new Promise((resolve) => window.setTimeout(resolve, 320));
     localStorage.setItem(LIGHTING_STORAGE_KEY, JSON.stringify(workspace));
     setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
-    setSyncMessage('模拟接口返回 200，本地草稿保持一致');
-    toast({ title: '当前方案已保存', description: syncMessage, status: 'success', duration: 2200 });
+    const author = roleLabels[workspace.role];
+    const snapshot = readServerSnapshot();
+
+    // 版本一致：直接保存为新版本
+    if (!snapshot || snapshot.revision === baseRevision) {
+      const next: ServerSnapshot = {
+        revision: (snapshot?.revision ?? 0) + 1,
+        savedBy: author,
+        savedAt: new Date().toISOString(),
+        workspace: structuredClone(workspace),
+        pendingDrafts: snapshot?.pendingDrafts ?? pendingDrafts
+      };
+      writeServerSnapshot(next);
+      setServerSnapshot(next);
+      setPendingDrafts(next.pendingDrafts);
+      setBaseRevision(next.revision);
+      baseWorkspaceRef.current = structuredClone(workspace);
+      setSyncMessage(`已保存为版本 r${next.revision}，本地草稿保持一致`);
+      toast({ title: '当前方案已保存', status: 'success', duration: 2200 });
+      return;
+    }
+
+    // 另一终端已先保存：核对双方是否改了同一回路
+    const base = baseWorkspaceRef.current ?? snapshot.workspace;
+    const myChanges = diffCircuitChanges(base.plans, workspace.plans);
+    const theirChanges = diffCircuitChanges(base.plans, snapshot.workspace.plans);
+
+    if (hasCircuitOverlap(myChanges, theirChanges, workspace.plans, snapshot.workspace.plans)) {
+      // 同一回路冲突：保留双方草稿，绝不覆盖对方版本
+      const draft: PendingCircuitDraft = {
+        id: `draft-${Date.now().toString(36)}`,
+        planId: activePlan.id,
+        author,
+        savedAt: new Date().toISOString(),
+        baseRevision,
+        circuits: structuredClone(activePlan.circuits),
+        patch: structuredClone(activePlan.patch)
+      };
+      snapshot.pendingDrafts = [
+        ...snapshot.pendingDrafts.filter((item) => !(item.planId === draft.planId && item.author === author)),
+        draft
+      ];
+      writeServerSnapshot(snapshot);
+      setServerSnapshot(snapshot);
+      setPendingDrafts(snapshot.pendingDrafts);
+      setSyncMessage(`检测到与 ${snapshot.savedBy} 同时修改同一回路：双方草稿已保留，待确认差异`);
+      toast({
+        title: '未覆盖对方版本',
+        description: '你的回路修改已存为待确认草稿，请在“回路负载”页签核对差异。',
+        status: 'warning',
+        duration: 4200
+      });
+      return;
+    }
+
+    // 回路无重叠：合并对方的回路改动后保存
+    const merged = mergeTheirCircuitChanges(structuredClone(workspace), base.plans, snapshot.workspace.plans);
+    const next: ServerSnapshot = {
+      revision: snapshot.revision + 1,
+      savedBy: author,
+      savedAt: new Date().toISOString(),
+      workspace: structuredClone(merged),
+      pendingDrafts: snapshot.pendingDrafts
+    };
+    writeServerSnapshot(next);
+    setServerSnapshot(next);
+    setPendingDrafts(next.pendingDrafts);
+    setBaseRevision(next.revision);
+    baseWorkspaceRef.current = structuredClone(merged);
+    commit('合并另一终端的回路改动', (draft) => {
+      for (const plan of draft.plans) {
+        const mergedPlan = merged.plans.find((item) => item.id === plan.id);
+        if (mergedPlan) {
+          plan.circuits = mergedPlan.circuits;
+          plan.patch = mergedPlan.patch;
+        }
+      }
+    });
+    setSyncMessage(`已自动合并 ${snapshot.savedBy} 的回路改动，保存为版本 r${next.revision}`);
+    toast({ title: '已合并并保存', status: 'success', duration: 2200 });
+  }
+
+  function applyPendingDraft(draft: PendingCircuitDraft) {
+    const snapshot = readServerSnapshot();
+    if (!snapshot) return;
+    const serverPlan = snapshot.workspace.plans.find((plan) => plan.id === draft.planId);
+    if (serverPlan) {
+      serverPlan.circuits = structuredClone(draft.circuits);
+      serverPlan.patch = structuredClone(draft.patch);
+    }
+    snapshot.revision += 1;
+    snapshot.savedBy = `${draft.author}（确认草稿）`;
+    snapshot.savedAt = new Date().toISOString();
+    snapshot.pendingDrafts = snapshot.pendingDrafts.filter((item) => item.id !== draft.id);
+    writeServerSnapshot(snapshot);
+    commit('确认采用待确认的回路草稿', (next) => {
+      const plan = next.plans.find((item) => item.id === draft.planId);
+      if (plan) {
+        plan.circuits = structuredClone(draft.circuits);
+        plan.patch = structuredClone(draft.patch);
+      }
+    });
+    setServerSnapshot(snapshot);
+    setPendingDrafts(snapshot.pendingDrafts);
+    setBaseRevision(snapshot.revision);
+    baseWorkspaceRef.current = structuredClone(snapshot.workspace);
+    setSyncMessage(`草稿已确认，服务器版本推进到 r${snapshot.revision}`);
+    toast({ title: '已采用该草稿并同步', status: 'success', duration: 2200 });
+  }
+
+  function discardPendingDraft(draft: PendingCircuitDraft) {
+    const snapshot = readServerSnapshot();
+    if (!snapshot) return;
+    snapshot.pendingDrafts = snapshot.pendingDrafts.filter((item) => item.id !== draft.id);
+    writeServerSnapshot(snapshot);
+    const serverPlan = snapshot.workspace.plans.find((plan) => plan.id === draft.planId);
+    if (serverPlan) {
+      commit('放弃本地回路草稿，保留对方版本', (next) => {
+        const plan = next.plans.find((item) => item.id === draft.planId);
+        if (plan) {
+          plan.circuits = structuredClone(serverPlan.circuits);
+          plan.patch = structuredClone(serverPlan.patch);
+        }
+      });
+    }
+    setServerSnapshot(snapshot);
+    setPendingDrafts(snapshot.pendingDrafts);
+    setBaseRevision(snapshot.revision);
+    baseWorkspaceRef.current = structuredClone(snapshot.workspace);
+    setSyncMessage('已放弃本地草稿，保留对方保存的回路版本');
+  }
+
+  function simulatePeerSave() {
+    const snapshot = readServerSnapshot();
+    const peerWorkspace = snapshot?.workspace ?? structuredClone(workspace);
+    const plan = peerWorkspace.plans.find((item) => item.id === activePlan.id) ?? peerWorkspace.plans[0];
+    const circuitItem = plan?.circuits[0];
+    if (!plan || !circuitItem) return;
+    circuitItem.capacity = Math.max(4, Number((circuitItem.capacity - 2).toFixed(1)));
+    const entry = plan.patch.find((item) => item.circuitId === circuitItem.id);
+    if (entry) entry.ratedCurrent = Number((entry.ratedCurrent + 1).toFixed(1));
+    const next: ServerSnapshot = {
+      revision: (snapshot?.revision ?? baseRevision) + 1,
+      savedBy: '另一终端 · 编程执行',
+      savedAt: new Date().toISOString(),
+      workspace: peerWorkspace,
+      pendingDrafts: snapshot?.pendingDrafts ?? pendingDrafts
+    };
+    writeServerSnapshot(next);
+    setServerSnapshot(next);
+    setPendingDrafts(next.pendingDrafts);
+    setSyncMessage(`另一终端已把 ${circuitItem.name} 容量调为 ${circuitItem.capacity}A（版本 r${next.revision}），你的保存将触发差异核对`);
+    toast({ title: '已模拟另一终端保存', description: `${circuitItem.name} 容量 -2A`, status: 'info', duration: 2600 });
+  }
+
+  function updateCircuit(circuitId: string, changes: Partial<Circuit>) {
+    commit('修改回路参数并重算负载', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      const target = plan?.circuits.find((item) => item.id === circuitId);
+      if (target) Object.assign(target, changes);
+    });
+  }
+
+  function addCircuit() {
+    commit('新增配电回路', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      if (!plan) return;
+      plan.circuits.push({
+        id: `cir-${Date.now().toString(36)}`,
+        name: `回路 ${plan.circuits.length + 1}`,
+        capacity: 16
+      });
+    });
+  }
+
+  function updatePatch(patchId: string, changes: Partial<PositionPatch>) {
+    commit('调整灯位回路登记并重算负载', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      const entry = plan?.patch.find((item) => item.id === patchId);
+      if (entry) Object.assign(entry, changes);
+    });
+  }
+
+  function addPatchEntry() {
+    commit('新增灯位回路登记', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      if (!plan) return;
+      plan.patch.push({
+        id: `patch-${Date.now().toString(36)}`,
+        position: '新灯位',
+        circuitId: plan.circuits[0]?.id ?? '',
+        ratedCurrent: 8
+      });
+    });
+  }
+
+  function removePatchEntry(patchId: string) {
+    commit('移除灯位回路登记', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      if (plan) plan.patch = plan.patch.filter((item) => item.id !== patchId);
+    });
   }
 
   useEffect(() => {
@@ -801,9 +1332,20 @@ export default function App() {
   }
 
   function exportPlan() {
+    const overload = activeConflicts.find((item) => item.type === 'circuit-overload');
+    if (overload) {
+      toast({
+        title: '存在回路过载时段，已拒绝导出',
+        description: overload.message,
+        status: 'error',
+        duration: 4200
+      });
+      return;
+    }
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
+      circuitReports,
       conflicts: activeConflicts,
       role: workspace.role
     };
@@ -1074,6 +1616,7 @@ export default function App() {
               <TabList px={3} pt={2}>
                 <Tab>提示编辑</Tab>
                 <Tab>冲突 <Badge ml={1} colorScheme={activeConflicts.length ? 'orange' : 'green'}>{activeConflicts.length}</Badge></Tab>
+                <Tab>回路负载 <Badge ml={1} colorScheme={overloadCount ? 'red' : 'green'}>{overloadCount}</Badge></Tab>
                 <Tab>关系图</Tab>
               </TabList>
               <TabPanels>
@@ -1087,6 +1630,7 @@ export default function App() {
                       canEdit={editable}
                       conflicts={activeCueConflicts}
                       onApply={applyCue}
+                      onBrightnessCommit={applyBrightness}
                       onDelete={deleteCue}
                       onSelectCue={(cueId) => selectCue(activeScene.id, cueId)}
                     />
@@ -1096,6 +1640,23 @@ export default function App() {
                   <ConflictList
                     conflicts={activeConflicts}
                     onSelect={(sceneId, cueId) => selectCue(sceneId, cueId)}
+                  />
+                </TabPanel>
+                <TabPanel px={4} pb={5}>
+                  <CircuitPanel
+                    plan={activePlan}
+                    reports={circuitReports}
+                    canPatch={patcher}
+                    pendingDrafts={pendingDrafts}
+                    serverSnapshot={serverSnapshot}
+                    onUpdateCircuit={updateCircuit}
+                    onAddCircuit={addCircuit}
+                    onUpdatePatch={updatePatch}
+                    onAddPatch={addPatchEntry}
+                    onRemovePatch={removePatchEntry}
+                    onApplyDraft={applyPendingDraft}
+                    onDiscardDraft={discardPendingDraft}
+                    onSimulatePeer={simulatePeerSave}
                   />
                 </TabPanel>
                 <TabPanel px={4} pb={5}>

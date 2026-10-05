@@ -169,6 +169,10 @@ export function canFreeze(role: UserRole) {
   return role === 'designer' || role === 'stage-manager';
 }
 
+export function canPatchCircuits(role: UserRole) {
+  return role === 'designer' || role === 'programmer';
+}
+
 export function formatTime(value: number | undefined) {
   const safe = Math.max(0, value ?? 0);
   const minutes = Math.floor(safe / 60);
