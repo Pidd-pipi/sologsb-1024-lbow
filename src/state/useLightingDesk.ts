@@ -1,22 +1,67 @@
 import { useReducer } from 'react';
 import { recalculatePlans, samplePlans } from '../data';
-import type { Cue, EditorState, LightingPlan, Scene, UserRole, Workspace } from '../types';
+import {
+  createCollabState,
+  discardCollabPending,
+  editCollabDraft,
+  removeCollabDraftChange,
+  rebaseCollabToPlan,
+  resetCollabRound,
+  resolveCollabMerge,
+  saveCollabDraft
+} from './collab';
+import type {
+  Circuit,
+  Cue,
+  EditorState,
+  FixtureChange,
+  LightingPlan,
+  Scene,
+  UserRole,
+  Workspace,
+  CollabOwner
+} from '../types';
 
-export const LIGHTING_STORAGE_KEY = 'sologsb-1024/lighting-cue-desk/v1';
+export const LIGHTING_STORAGE_KEY = 'sologsb-1024/lighting-cue-desk/v2';
 
 function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+function defaultCircuit(plan: LightingPlan): Circuit {
+  return { id: `${plan.id}-ckt-default`, name: '默认回路', capacity: 16 };
+}
+
+/** 迁移：为没有回路的方案建立默认回路，并把未分配回路的提示挂到默认回路上。 */
+function migrateCircuits(plans: LightingPlan[]) {
+  for (const plan of plans) {
+    if (!Array.isArray(plan.circuits) || !plan.circuits.length) {
+      plan.circuits = [defaultCircuit(plan)];
+    }
+    if (typeof plan.voltage !== 'number') plan.voltage = 220;
+    const fallback = plan.circuits[0].id;
+    for (const scene of plan.scenes) {
+      for (const cue of scene.cues) {
+        if (!cue.circuitId || !plan.circuits.some((c) => c.id === cue.circuitId)) {
+          cue.circuitId = fallback;
+        }
+        if (typeof cue.wattage !== 'number') cue.wattage = 0;
+      }
+    }
+  }
+}
+
 export function createInitialWorkspace(): Workspace {
   const plans = recalculatePlans(clone(samplePlans));
+  migrateCircuits(plans);
   return {
     plans,
     activePlanId: plans[0].id,
     comparePlanId: plans[1].id,
     selectedSceneId: plans[0].scenes[0].id,
     selectedCueId: plans[0].scenes[0].cues[0].id,
-    role: 'designer'
+    role: 'designer',
+    collab: createCollabState(plans[0].id)
   };
 }
 
@@ -37,10 +82,17 @@ export type EditorAction =
   | { type: 'selectPlan'; planId: string }
   | { type: 'comparePlan'; planId: string }
   | { type: 'setRole'; role: UserRole }
+  | { type: 'collabEdit'; owner: CollabOwner; cueId: string; change: FixtureChange }
+  | { type: 'collabRemove'; owner: CollabOwner; cueId: string }
+  | { type: 'collabSave'; owner: CollabOwner }
+  | { type: 'collabResolve'; resolutions: Record<string, CollabOwner> }
+  | { type: 'collabDiscard' }
+  | { type: 'collabReset' }
   | { type: 'undo' }
   | { type: 'redo' };
 
 function normalizeWorkspace(workspace: Workspace) {
+  migrateCircuits(workspace.plans);
   recalculatePlans(workspace.plans);
   const active = workspace.plans.find((plan) => plan.id === workspace.activePlanId) ?? workspace.plans[0];
   if (!active) return workspace;
@@ -54,6 +106,7 @@ function normalizeWorkspace(workspace: Workspace) {
   workspace.selectedCueId = scene?.cues.some((cue) => cue.id === workspace.selectedCueId)
     ? workspace.selectedCueId
     : scene?.cues[0]?.id ?? '';
+  if (!workspace.collab) workspace.collab = createCollabState(active.id);
   return workspace;
 }
 
@@ -104,22 +157,65 @@ export function lightingReducer(state: EditorState, action: EditorAction): Edito
       const plan = state.workspace.plans.find((item) => item.id === action.planId);
       return {
         ...state,
-        workspace: {
-          ...state.workspace,
-          activePlanId: action.planId,
-          comparePlanId:
-            action.planId === state.workspace.comparePlanId
-              ? state.workspace.plans.find((item) => item.id !== action.planId)?.id ?? action.planId
-              : state.workspace.comparePlanId,
-          selectedSceneId: plan?.scenes[0]?.id ?? '',
-          selectedCueId: plan?.scenes[0]?.cues[0]?.id ?? ''
-        }
+        workspace: rebaseCollabToPlan(
+          {
+            ...state.workspace,
+            activePlanId: action.planId,
+            comparePlanId:
+              action.planId === state.workspace.comparePlanId
+                ? state.workspace.plans.find((item) => item.id !== action.planId)?.id ?? action.planId
+                : state.workspace.comparePlanId,
+            selectedSceneId: plan?.scenes[0]?.id ?? '',
+            selectedCueId: plan?.scenes[0]?.cues[0]?.id ?? ''
+          },
+          action.planId
+        )
       };
     }
     case 'comparePlan':
       return { ...state, workspace: { ...state.workspace, comparePlanId: action.planId } };
     case 'setRole':
       return { ...state, workspace: { ...state.workspace, role: action.role } };
+    case 'collabEdit':
+      return {
+        ...state,
+        workspace: {
+          ...state.workspace,
+          collab: editCollabDraft(state.workspace.collab, action.owner, action.cueId, action.change)
+        }
+      };
+    case 'collabRemove':
+      return {
+        ...state,
+        workspace: {
+          ...state.workspace,
+          collab: removeCollabDraftChange(state.workspace.collab, action.owner, action.cueId)
+        }
+      };
+    case 'collabSave': {
+      const before = clone(state.workspace);
+      const result = saveCollabDraft(before, action.owner);
+      return {
+        ...state,
+        workspace: result.workspace,
+        lastAction: result.conflicts.length
+          ? '双方修改同一回路，进入待确认差异'
+          : `已保存${action.owner === 'designer' ? '灯光设计' : '编程执行'}草稿`
+      };
+    }
+    case 'collabResolve': {
+      const before = clone(state.workspace);
+      const resolved = resolveCollabMerge(before, action.resolutions);
+      return {
+        ...state,
+        workspace: resolved,
+        lastAction: '已确认双方差异并保留草稿'
+      };
+    }
+    case 'collabDiscard':
+      return { ...state, workspace: discardCollabPending(state.workspace) };
+    case 'collabReset':
+      return { ...state, workspace: resetCollabRound(state.workspace) };
     case 'undo': {
       const previous = state.past.at(-1);
       if (!previous) return state;
@@ -176,3 +272,4 @@ export function formatTime(value: number | undefined) {
   const tenths = Math.floor((safe % 1) * 10);
   return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${tenths}`;
 }
+

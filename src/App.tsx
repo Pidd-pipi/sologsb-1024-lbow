@@ -96,7 +96,20 @@ import {
   formatTime,
   useLightingDesk
 } from './state/useLightingDesk';
-import type { Cue, CueConflict, LightingPlan, Scene, UserRole, Workspace } from './types';
+import { planHasOverload, sceneHasOverload } from './state/load';
+import CircuitPanel from './components/CircuitPanel';
+import CollabPanel from './components/CollabPanel';
+import type {
+  Circuit,
+  CollabOwner,
+  Cue,
+  CueConflict,
+  FixtureChange,
+  LightingPlan,
+  Scene,
+  UserRole,
+  Workspace
+} from './types';
 
 const statusColors = {
   draft: 'orange',
@@ -110,6 +123,7 @@ function conflictLabel(conflict: CueConflict) {
     'follow-order': '跟随关系',
     'missing-data': '数据缺失',
     'duplicate-position': '灯位重复',
+    'circuit-overload': '回路过载',
     duration: '时间异常'
   }[conflict.type];
 }
@@ -119,11 +133,12 @@ interface SortableCueRowProps {
   index: number;
   selected: boolean;
   disabled: boolean;
+  circuitName: string;
   conflicts: CueConflict[];
   onSelect: () => void;
 }
 
-function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }: SortableCueRowProps) {
+function SortableCueRow({ cue, index, selected, disabled, circuitName, conflicts, onSelect }: SortableCueRowProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: cue.id,
     disabled
@@ -173,7 +188,7 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
             {cue.followCueId ? <Tag size="sm" variant="subtle" colorScheme="purple">跟随</Tag> : null}
           </Flex>
           <Text color="whiteAlpha.500" fontSize="xs" noOfLines={1}>
-            {cue.position} · {cue.channel} · {cue.color}
+            {cue.position} · {cue.channel} · {circuitName} · {cue.color}
           </Text>
         </Box>
         <Box w="72px" textAlign="right">
@@ -199,6 +214,7 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
 
 interface CueListProps {
   scene: Scene;
+  circuits: Circuit[];
   selectedCueId: string;
   canEdit: boolean;
   conflicts: CueConflict[];
@@ -206,7 +222,7 @@ interface CueListProps {
   onReorder: (activeId: string, overId: string) => void;
 }
 
-function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder }: CueListProps) {
+function CueList({ scene, circuits, selectedCueId, canEdit, conflicts, onSelect, onReorder }: CueListProps) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -229,6 +245,7 @@ function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder
               index={index}
               selected={cue.id === selectedCueId}
               disabled={!canEdit}
+              circuitName={circuits.find((c) => c.id === cue.circuitId)?.name ?? '未分配回路'}
               conflicts={conflicts.filter((item) => item.cueId === cue.id)}
               onSelect={() => onSelect(cue.id)}
             />
@@ -247,6 +264,7 @@ function CueList({ scene, selectedCueId, canEdit, conflicts, onSelect, onReorder
 interface InspectorProps {
   cue: Cue | undefined;
   scene: Scene;
+  circuits: Circuit[];
   roles: UserRole;
   workspace: Workspace;
   canEdit: boolean;
@@ -256,7 +274,7 @@ interface InspectorProps {
   onSelectCue: (cueId: string) => void;
 }
 
-function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDelete, onSelectCue }: InspectorProps) {
+function CueInspector({ cue, scene, circuits, workspace, canEdit, conflicts, onApply, onDelete, onSelectCue }: InspectorProps) {
   const [draft, setDraft] = useState<Cue | null>(cue ? structuredClone(cue) : null);
 
   useEffect(() => {
@@ -314,6 +332,38 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
         <FormControl>
           <FormLabel htmlFor="cue-channel">控制通道</FormLabel>
           <Input id="cue-channel" value={draft.channel} isDisabled={!canEdit} onChange={(event) => update('channel', event.target.value)} />
+        </FormControl>
+        <FormControl>
+          <FormLabel htmlFor="cue-circuit">所属回路</FormLabel>
+          <Select
+            id="cue-circuit"
+            value={draft.circuitId}
+            isDisabled={!canEdit}
+            onChange={(event) => update('circuitId', event.target.value)}
+          >
+            <option value="">未分配回路</option>
+            {circuits.map((circuit) => (
+              <option key={circuit.id} value={circuit.id}>{circuit.name}（{circuit.capacity}A）</option>
+            ))}
+          </Select>
+        </FormControl>
+        <FormControl>
+          <FormLabel htmlFor="cue-wattage">灯具功率（W）</FormLabel>
+          <NumberInput
+            id="cue-wattage"
+            min={0}
+            max={20000}
+            step={100}
+            value={draft.wattage}
+            isDisabled={!canEdit}
+            onChange={(_, value) => update('wattage', Number.isNaN(value) ? draft.wattage : value)}
+          >
+            <NumberInputField />
+            <NumberInputStepper>
+              <NumberIncrementStepper />
+              <NumberDecrementStepper />
+            </NumberInputStepper>
+          </NumberInput>
         </FormControl>
         <FormControl>
           <FormLabel htmlFor="cue-color">颜色名称</FormLabel>
@@ -586,6 +636,11 @@ export default function App() {
   const editable = canEditScene(workspace.role, activeScene);
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
+  const planOverloaded = useMemo(() => planHasOverload(activePlan), [activePlan]);
+  const sceneOverloaded = useMemo(
+    () => (activeScene ? sceneHasOverload(activePlan, activeScene.id) : false),
+    [activePlan, activeScene]
+  );
 
   useEffect(() => {
     try {
@@ -677,6 +732,8 @@ export default function App() {
         label: '新提示',
         position: '待指定',
         channel: '',
+        circuitId: activePlan.circuits[0]?.id ?? '',
+        wattage: 0,
         color: '暖白',
         colorHex: '#FFF1C7',
         brightness: 60,
@@ -695,6 +752,15 @@ export default function App() {
   function toggleFreeze() {
     if (!activeScene || !freezer) {
       toast({ title: '当前角色不能冻结或解冻场次', status: 'warning' });
+      return;
+    }
+    if (!activeScene.frozen && sceneOverloaded) {
+      toast({
+        title: '回路过载，拒绝冻结',
+        description: '该场次时间范围内存在超过额定电流的回路，请先调整灯具分配或亮度。',
+        status: 'error',
+        duration: 3200
+      });
       return;
     }
     commit(activeScene.frozen ? '解除场次冻结' : '冻结已确认场次', (next) => {
@@ -800,7 +866,86 @@ export default function App() {
     dispatch({ type: 'selectCue', sceneId, cueId });
   }
 
+  function addCircuit() {
+    commit('新增回路', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      if (!plan) return;
+      const index = plan.circuits.length + 1;
+      plan.circuits.push({
+        id: `${plan.id}-ckt-${Date.now().toString(36)}`,
+        name: `回路 ${index}`,
+        capacity: 16
+      });
+    });
+  }
+
+  function updateCircuit(circuitId: string, patch: Partial<Circuit>) {
+    commit('编辑回路参数', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      const circuit = plan?.circuits.find((item) => item.id === circuitId);
+      if (circuit) Object.assign(circuit, patch);
+    });
+  }
+
+  function deleteCircuit(circuitId: string) {
+    commit('删除回路', (next) => {
+      const plan = next.plans.find((item) => item.id === next.activePlanId);
+      if (!plan) return;
+      const fallback = plan.circuits.find((item) => item.id !== circuitId);
+      plan.circuits = plan.circuits.filter((item) => item.id !== circuitId);
+      for (const scene of plan.scenes) {
+        for (const cue of scene.cues) {
+          if (cue.circuitId === circuitId) cue.circuitId = fallback?.id ?? '';
+        }
+      }
+    });
+  }
+
+  function assignCueCircuit(cueId: string, circuitId: string) {
+    commit('调整灯具回路', (next) => {
+      for (const plan of next.plans) {
+        for (const scene of plan.scenes) {
+          const cue = scene.cues.find((item) => item.id === cueId);
+          if (cue) cue.circuitId = circuitId;
+        }
+      }
+    });
+  }
+
+  function collabEdit(owner: CollabOwner, cueId: string, change: FixtureChange) {
+    dispatch({ type: 'collabEdit', owner, cueId, change });
+  }
+
+  function collabRemove(owner: CollabOwner, cueId: string) {
+    dispatch({ type: 'collabRemove', owner, cueId });
+  }
+
+  function collabSave(owner: CollabOwner) {
+    dispatch({ type: 'collabSave', owner });
+  }
+
+  function collabResolve(resolutions: Record<string, CollabOwner>) {
+    dispatch({ type: 'collabResolve', resolutions });
+  }
+
+  function collabDiscard() {
+    dispatch({ type: 'collabDiscard' });
+  }
+
+  function collabReset() {
+    dispatch({ type: 'collabReset' });
+  }
+
   function exportPlan() {
+    if (planOverloaded) {
+      toast({
+        title: '回路过载，拒绝导出',
+        description: '当前方案存在超过额定电流的回路，请先消除过载后再导出。',
+        status: 'error',
+        duration: 3200
+      });
+      return;
+    }
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
@@ -938,6 +1083,15 @@ export default function App() {
               </VStack>
             </Box>
 
+            <CircuitPanel
+              plan={activePlan}
+              onAddCircuit={addCircuit}
+              onUpdateCircuit={updateCircuit}
+              onDeleteCircuit={deleteCircuit}
+              onAssignCue={assignCueCircuit}
+              onSelectCue={(sceneId, cueId) => selectCue(sceneId, cueId)}
+            />
+
             <Box borderWidth="1px" borderColor="whiteAlpha.100" borderRadius="xl" bg="whiteAlpha.50" p={4}>
               <Heading size="sm" mb={3}>执行概览</Heading>
               <SimpleGrid columns={2} spacing={2}>
@@ -965,6 +1119,17 @@ export default function App() {
                 {workspace.role === 'readonly' && '只读查看所有方案、冲突和比较结果。'}
               </Text>
             </Box>
+
+            <CollabPanel
+              plan={activePlan}
+              collab={workspace.collab}
+              onEdit={collabEdit}
+              onRemove={collabRemove}
+              onSave={collabSave}
+              onResolve={collabResolve}
+              onDiscard={collabDiscard}
+              onReset={collabReset}
+            />
 
             <Button variant="outline" leftIcon={<Copy size={16} />} onClick={duplicatePlan}>复制为新方案</Button>
             <Button variant="ghost" leftIcon={<RefreshCw size={16} />} onClick={exportPlan}>导出当前方案 JSON</Button>
@@ -1041,6 +1206,7 @@ export default function App() {
 
               <CueList
                 scene={activeScene}
+                circuits={activePlan.circuits}
                 selectedCueId={workspace.selectedCueId}
                 canEdit={editable}
                 conflicts={activeConflicts}
@@ -1082,6 +1248,7 @@ export default function App() {
                     <CueInspector
                       cue={selectedCue}
                       scene={activeScene}
+                      circuits={activePlan.circuits}
                       roles={workspace.role}
                       workspace={workspace}
                       canEdit={editable}

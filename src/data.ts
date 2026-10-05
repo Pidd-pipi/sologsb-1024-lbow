@@ -1,3 +1,4 @@
+import { analyzePlan, locateOverload } from './state/load';
 import type { Cue, CueConflict, LightingPlan, Scene, UserRole } from './types';
 
 const FIXED_TIME = '2026-09-25T02:00:00.000Z';
@@ -34,6 +35,8 @@ function cue(
   label: string,
   position: string,
   channel: string,
+  circuitId: string,
+  wattage: number,
   color: string,
   colorHex: string,
   brightness: number,
@@ -52,6 +55,8 @@ function cue(
     label,
     position,
     channel,
+    circuitId,
+    wattage,
     color,
     colorHex,
     brightness,
@@ -69,33 +74,44 @@ function scene(id: string, name: string, order: number, frozen: boolean, cues: C
   return { id, name, order, frozen, cues };
 }
 
+function circuit(id: string, name: string, capacity: number) {
+  return { id, name, capacity };
+}
+
 const mainPlan: LightingPlan = {
   id: 'plan-main',
   name: '主舞台方案',
   description: '完整剧院版本，保留大面积侧光与低角度造型。',
+  voltage: 220,
   updatedAt: FIXED_TIME,
+  circuits: [
+    circuit('ckt-main-a', '调光柜 A · 回路1', 20),
+    circuit('ckt-main-b', '调光柜 A · 回路2', 20),
+    circuit('ckt-main-c', '调光柜 B · 回路1', 20),
+    circuit('ckt-main-d', '调光柜 B · 回路2', 16)
+  ],
   scenes: [
     scene('scene-1', '序章 · 入梦', 1, false, [
-      cue('Q1', '观众席暗场', '全台', 'Grand Master', '黑场', '#000000', 0, 4, 6, 3, '', '场灯降至 10%', '开演提示与场灯联动。', 'confirmed'),
-      cue('Q2', '月幕初升', '天幕', 'Cyc 1', '深蓝', '#1D4ED8', 62, 8, 18, 6, 'cue-1', '月幕形成冷色底', '天幕均匀，避免中心热斑。'),
-      cue('Q3', '人物侧光', '左前区', 'FOH L 3', '暖白', '#FFF1C7', 74, 2.5, 22, 5, 'cue-2', '演员入画', '为独白人物补面，保留右侧阴影。', 'ready'),
-      cue('Q4', '雾门显现', '后区', 'Beam 2', '天青', '#0EA5E9', 58, 5, 12, 8, '', '雾机启动后可见', '通道尚未实测。', 'draft')
+      cue('Q1', '观众席暗场', '全台', 'Grand Master', 'ckt-main-a', 100, '黑场', '#000000', 0, 4, 6, 3, '', '场灯降至 10%', '开演提示与场灯联动。', 'confirmed'),
+      cue('Q2', '月幕初升', '天幕', 'Cyc 1', 'ckt-main-b', 1200, '深蓝', '#1D4ED8', 62, 8, 18, 6, 'cue-1', '月幕形成冷色底', '天幕均匀，避免中心热斑。'),
+      cue('Q3', '人物侧光', '左前区', 'FOH L 3', 'ckt-main-a', 800, '暖白', '#FFF1C7', 74, 2.5, 22, 5, 'cue-2', '演员入画', '为独白人物补面，保留右侧阴影。', 'ready'),
+      cue('Q4', '雾门显现', '后区', 'Beam 2', 'ckt-main-d', 1500, '天青', '#0EA5E9', 58, 5, 12, 8, '', '雾机启动后可见', '通道尚未实测。', 'draft')
     ]),
     scene('scene-2', '独白 · 失语', 2, false, [
-      cue('Q10', '独白收束', '前区', 'FOH 1-4', '琥珀', '#F59E0B', 46, 7, 32, 9, '', '演员坐于长椅', '压低背景，仅保留边光。'),
-      cue('Q11', '呼吸变化', '前区', 'FOH L 3', '暖白', '#FFF1C7', 72, 3, 8, 3, 'cue-5', '吸气点触发', '与台词“我听见”同步。', 'ready'),
-      cue('Q12', '影子分裂', '侧幕', 'Side 5', '品红', '#D946EF', 54, 2, 15, 7, 'cue-11', '两次呼吸后', '需要检查侧幕遮挡。', 'draft'),
-      cue('Q13', '冷色侵入', '全台', 'Grand Master', '深蓝', '#1D4ED8', 38, 10, 24, 12, '', '音乐低频进入', '与 Q12 通道存在叠光风险。')
+      cue('Q10', '独白收束', '前区', 'FOH 1-4', 'ckt-main-a', 2000, '琥珀', '#F59E0B', 46, 7, 32, 9, '', '演员坐于长椅', '压低背景，仅保留边光。'),
+      cue('Q11', '呼吸变化', '前区', 'FOH L 3', 'ckt-main-b', 800, '暖白', '#FFF1C7', 72, 3, 8, 3, 'cue-5', '吸气点触发', '与台词“我听见”同步。', 'ready'),
+      cue('Q12', '影子分裂', '侧幕', 'Side 5', 'ckt-main-d', 1200, '品红', '#D946EF', 54, 2, 15, 7, 'cue-11', '两次呼吸后', '需要检查侧幕遮挡。', 'draft'),
+      cue('Q13', '冷色侵入', '全台', 'Grand Master', 'ckt-main-a', 3000, '深蓝', '#1D4ED8', 38, 10, 24, 12, '', '音乐低频进入', '与 Q12 通道存在叠光风险。')
     ]),
     scene('scene-3', '群舞 · 潮汐', 3, false, [
-      cue('Q20', '群舞起光', '后区', 'Dance 1-6', '松绿', '#059669', 68, 2, 18, 4, '', '第一组舞者进入', '两侧亮度需平衡。', 'ready'),
-      cue('Q21', '潮线推移', '侧区', 'Side 1-4', '天青', '#0EA5E9', 60, 5, 16, 5, 'cue-9', '第二组越过中线', '跟随舞者视线。'),
-      cue('Q22', '高点爆闪', '全台', 'Grand Master', '暖白', '#FFF1C7', 92, 0.3, 0.8, 8, 'cue-10', '定音鼓重音', '确认频闪安全。', 'draft'),
-      cue('Q23', '潮退', '后区', 'Dance 1-6', '深蓝', '#1D4ED8', 26, 12, 28, 14, '', '音乐进入尾奏', '')
+      cue('Q20', '群舞起光', '后区', 'Dance 1-6', 'ckt-main-c', 2400, '松绿', '#059669', 68, 2, 18, 4, '', '第一组舞者进入', '两侧亮度需平衡。', 'ready'),
+      cue('Q21', '潮线推移', '侧区', 'Side 1-4', 'ckt-main-c', 2400, '天青', '#0EA5E9', 60, 5, 16, 5, 'cue-9', '第二组越过中线', '跟随舞者视线。'),
+      cue('Q22', '高点爆闪', '全台', 'Grand Master', 'ckt-main-c', 4000, '暖白', '#FFF1C7', 92, 0.5, 6, 8, 'cue-9', '定音鼓重音', '确认频闪安全。', 'draft'),
+      cue('Q23', '潮退', '后区', 'Dance 1-6', 'ckt-main-d', 2400, '深蓝', '#1D4ED8', 26, 12, 28, 14, '', '音乐进入尾奏', '')
     ]),
     scene('scene-4', '终场 · 归岸', 4, true, [
-      cue('Q30', '归岸定点', '前区', 'FOH 1-2', '暖白', '#FFF1C7', 48, 8, 26, 10, '', '演员回到长椅', '已与导演确认。', 'confirmed'),
-      cue('Q31', '星空落幕', '天幕', 'Cyc 2', '薰衣草', '#8B5CF6', 34, 6, 36, 16, 'cue-12', '演员抬头后', '冻结场次，保留最终状态。', 'confirmed')
+      cue('Q30', '归岸定点', '前区', 'FOH 1-2', 'ckt-main-b', 1600, '暖白', '#FFF1C7', 48, 8, 26, 10, '', '演员回到长椅', '已与导演确认。', 'confirmed'),
+      cue('Q31', '星空落幕', '天幕', 'Cyc 2', 'ckt-main-d', 1200, '薰衣草', '#8B5CF6', 34, 6, 36, 16, 'cue-12', '演员抬头后', '冻结场次，保留最终状态。', 'confirmed')
     ])
   ]
 };
@@ -104,15 +120,20 @@ const coolPlan: LightingPlan = {
   id: 'plan-cool',
   name: '冷调实验方案',
   description: '减少正面光，以侧逆光和天幕色块建立空间。',
+  voltage: 220,
   updatedAt: FIXED_TIME,
+  circuits: [
+    circuit('ckt-cool-1', '冷调回路1', 16),
+    circuit('ckt-cool-2', '冷调回路2', 16)
+  ],
   scenes: [
     scene('cool-scene-1', '序章 · 入梦（冷调）', 1, false, [
-      cue('C1', '冷场', '全台', 'Grand Master', '深蓝', '#1D4ED8', 14, 5, 8, 5, '', '场灯渐暗', '冷调版本无全黑场。', 'ready'),
-      cue('C2', '逆光月幕', '天幕', 'Cyc 1', '天青', '#0EA5E9', 72, 10, 18, 8, 'cue-13', '月幕升起', '')
+      cue('C1', '冷场', '全台', 'Grand Master', 'ckt-cool-1', 2000, '深蓝', '#1D4ED8', 14, 5, 8, 5, '', '场灯渐暗', '冷调版本无全黑场。', 'ready'),
+      cue('C2', '逆光月幕', '天幕', 'Cyc 1', 'ckt-cool-2', 1200, '天青', '#0EA5E9', 72, 10, 18, 8, 'cue-13', '月幕升起', '')
     ]),
     scene('cool-scene-2', '独白 · 失语（冷调）', 2, false, [
-      cue('C10', '侧逆光', '左后', 'Beam 1', '薰衣草', '#8B5CF6', 58, 4, 28, 10, '', '演员背向观众', ''),
-      cue('C11', '边缘呼吸', '右侧', 'Side 5', '品红', '#D946EF', 42, 1, 7, 4, 'cue-14', '台词停顿', '')
+      cue('C10', '侧逆光', '左后', 'Beam 1', 'ckt-cool-1', 1500, '薰衣草', '#8B5CF6', 58, 4, 28, 10, '', '演员背向观众', ''),
+      cue('C11', '边缘呼吸', '右侧', 'Side 5', 'ckt-cool-2', 800, '品红', '#D946EF', 42, 1, 7, 4, 'cue-14', '台词停顿', '')
     ])
   ]
 };
@@ -121,15 +142,20 @@ const tourPlan: LightingPlan = {
   id: 'plan-tour',
   name: '巡演简约方案',
   description: '适配中小剧场，合并天幕和侧光通道。',
+  voltage: 220,
   updatedAt: FIXED_TIME,
+  circuits: [
+    circuit('ckt-tour-1', '巡演回路1', 16),
+    circuit('ckt-tour-2', '巡演回路2', 16)
+  ],
   scenes: [
     scene('tour-scene-1', '序章 · 入梦', 1, false, [
-      cue('T1', '场灯收束', '全台', 'Master', '暖白', '#FFF1C7', 18, 3, 5, 4, '', '开场', '巡演设备清单已确认。', 'ready'),
-      cue('T2', '蓝色天幕', '天幕', 'Wash A', '深蓝', '#1D4ED8', 55, 6, 24, 8, 'cue-15', '演员入场', '')
+      cue('T1', '场灯收束', '全台', 'Master', 'ckt-tour-1', 2000, '暖白', '#FFF1C7', 18, 3, 5, 4, '', '开场', '巡演设备清单已确认。', 'ready'),
+      cue('T2', '蓝色天幕', '天幕', 'Wash A', 'ckt-tour-2', 1200, '深蓝', '#1D4ED8', 55, 6, 24, 8, 'cue-15', '演员入场', '')
     ]),
     scene('tour-scene-2', '群舞 · 潮汐', 2, false, [
-      cue('T10', '侧光推进', '后区', 'Wash B', '松绿', '#059669', 64, 2, 20, 5, '', '群舞起点', ''),
-      cue('T11', '潮点', '全台', 'Master', '琥珀', '#F59E0B', 84, 1, 2, 7, 'cue-16', '鼓点', '')
+      cue('T10', '侧光推进', '后区', 'Wash B', 'ckt-tour-1', 1500, '松绿', '#059669', 64, 2, 20, 5, '', '群舞起点', ''),
+      cue('T11', '潮点', '全台', 'Master', 'ckt-tour-1', 3000, '琥珀', '#F59E0B', 84, 1, 2, 7, 'cue-16', '鼓点', '')
     ])
   ]
 };
@@ -149,8 +175,9 @@ export function recalculatePlans(plans: LightingPlan[]) {
         const followed = item.followCueId
           ? scene.cues.find((candidate) => candidate.id === item.followCueId)
           : undefined;
-        const followTime = followed?.endTime ? followed.endTime : sceneCursor;
-        item.startTime = Number(Math.max(sceneCursor, followTime).toFixed(2));
+        // 跟随提示在目标结束后触发（可与其他提示重叠）；无跟随时按顺序接在当前游标之后。
+        const followTime = followed?.endTime ?? sceneCursor;
+        item.startTime = Number(followTime.toFixed(2));
         item.endTime = Number((item.startTime + duration).toFixed(2));
         sceneCursor = Math.max(sceneCursor, item.endTime);
       }
@@ -172,6 +199,7 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
         if (!item.channel.trim()) errors.push('缺少通道');
         if (!item.position.trim()) errors.push('缺少灯位');
         if (!item.label.trim()) errors.push('缺少提示名称');
+        if (!item.circuitId) errors.push('未分配回路');
         if (item.brightness < 0 || item.brightness > 100) errors.push('亮度应在 0–100 之间');
         if (item.fadeIn < 0 || item.hold < 0 || item.fadeOut < 0) errors.push('渐变或保持时间不能为负');
         if (errors.length) {
@@ -242,6 +270,35 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
         }
       }
     }
+
+    // 回路过载：按整剧时间核对，标出峰值与冲突时段
+    for (const analysis of analyzePlan(plan)) {
+      if (!analysis.overloaded) continue;
+      for (let index = 0; index < analysis.overloads.length; index += 1) {
+        const overload = analysis.overloads[index];
+        const located = locateOverload(plan, overload);
+        conflicts.push({
+          id: `${plan.id}-${analysis.circuitId}-overload-${index}`,
+          planId: plan.id,
+          sceneId: located.sceneId,
+          cueId: located.cueId,
+          severity: 'error',
+          type: 'circuit-overload',
+          circuitId: analysis.circuitId,
+          startTime: overload.start,
+          endTime: overload.end,
+          peakLoad: overload.peakLoad,
+          capacity: analysis.capacity,
+          message: `回路 ${analysis.circuitName} 过载：${formatClock(overload.start)}–${formatClock(overload.end)} 峰值 ${overload.peakLoad.toFixed(1)}A（额定 ${analysis.capacity}A）`
+        });
+      }
+    }
   }
   return conflicts;
+}
+
+function formatClock(value: number): string {
+  const minutes = Math.floor(Math.max(0, value) / 60);
+  const seconds = Math.floor(Math.max(0, value) % 60);
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
 }
